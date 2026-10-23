@@ -17,7 +17,28 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// 1. Obtener lista única de Sedes Jurisdiccionales para el filtro
+// Crear automáticamente la tabla de incidencias al iniciar para evitar errores
+async function inicializarBD() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS incidencias (
+                id SERIAL PRIMARY KEY,
+                dni VARCHAR(8) NOT NULL REFERENCES participantes(dni) ON DELETE CASCADE,
+                col_turno INT NOT NULL,
+                tipo VARCHAR(50) NOT NULL,
+                estado VARCHAR(20) DEFAULT 'Pendiente',
+                observaciones TEXT,
+                fecha_registro TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Lima')
+            );
+        `);
+        console.log("Tabla incidencias verificada correctamente.");
+    } catch (err) {
+        console.error("Error al verificar tabla incidencias:", err.message);
+    }
+}
+inicializarBD();
+
+// 1. Obtener lista de Sedes Jurisdiccionales
 app.get('/api/sedes', async (req, res) => {
     try {
         const result = await pool.query(
@@ -29,13 +50,13 @@ app.get('/api/sedes', async (req, res) => {
     }
 });
 
-// 2. Obtener reporte principal (con filtros de turno, sede, búsqueda y estado)
+// 2. Obtener reporte principal
 app.get('/api/reporte', async (req, res) => {
     try {
         const { col = 10, buscar = '', estado = 'TODOS', sede = 'TODAS' } = req.query;
 
         let sql = `
-            SELECT p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
+            SELECT p.id, p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
                    p.sede_regional, p.sede_jurisdiccional,
                    CASE WHEN a.dni IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
                    to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora,
@@ -44,7 +65,7 @@ app.get('/api/reporte', async (req, res) => {
             LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
             WHERE 1=1
         `;
-        let params = [col];
+        let params = [parseInt(col, 10) || 10];
 
         if (sede !== 'TODAS' && sede.trim() !== '') {
             params.push(sede.trim());
@@ -56,7 +77,7 @@ app.get('/api/reporte', async (req, res) => {
             sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length} OR p.apellido_materno ILIKE $${params.length})`;
         }
 
-        sql += ` ORDER BY CAST(p.orden AS INTEGER) ASC`;
+        sql += ` ORDER BY p.id ASC`;
 
         const result = await pool.query(sql, params);
         let asistentes = result.rows;
@@ -73,14 +94,16 @@ app.get('/api/reporte', async (req, res) => {
 
         res.json({ total, presentes, faltantes, asistentes });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error("Error en /api/reporte:", error.message);
+        res.status(500).json({ total: 0, presentes: 0, faltantes: 0, asistentes: [], error: error.message });
     }
 });
 
-// 3. Registrar asistencia (Desde App Móvil Kotlin) y emitir por WebSocket
-app.post('/api/asistencia', async (req, res) => {
+// 3. Registrar asistencia (soporta tanto /api/asistencia como /api/registrar)
+async function registrarAsistenciaHandler(req, res) {
     try {
-        const { dni, col_turno, etiqueta_turno } = req.body;
+        const { dni, col_turno, col, etiqueta_turno } = req.body;
+        const turnoFinal = col_turno || col || 10;
 
         const partCheck = await pool.query(`SELECT * FROM participantes WHERE dni = $1`, [dni]);
         if (partCheck.rows.length === 0) {
@@ -94,20 +117,23 @@ app.post('/api/asistencia', async (req, res) => {
             DO UPDATE SET fecha_hora = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Lima')
             RETURNING *;
         `;
-        const result = await pool.query(insertQuery, [dni, col_turno, etiqueta_turno || `Turno ${col_turno}`]);
+        const result = await pool.query(insertQuery, [dni, turnoFinal, etiqueta_turno || `Turno ${turnoFinal}`]);
 
-        // Notificar a todos los paneles web abiertos en tiempo real
         io.emit('actualizacion_asistencia', {
             dni,
-            col_turno,
+            col_turno: turnoFinal,
             participante: partCheck.rows[0]
         });
 
-        res.json({ ok: true, registro: result.rows[0], participante: partCheck.rows[0] });
+        res.json({ ok: true, mensaje: 'Asistencia registrada', registro: result.rows[0], participante: partCheck.rows[0] });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
-});
+}
+
+app.post('/api/asistencia', registrarAsistenciaHandler);
+app.post('/api/registrar', registrarAsistenciaHandler);
+app.post('/api/asistencia/registrar', registrarAsistenciaHandler);
 
 // 4. Descargar Reporte Consolidado en Excel (.xlsx)
 app.get('/api/reportes/excel', async (req, res) => {
@@ -124,7 +150,7 @@ app.get('/api/reportes/excel', async (req, res) => {
             LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
             WHERE 1=1
         `;
-        let params = [col];
+        let params = [parseInt(col, 10) || 10];
 
         if (sede !== 'TODAS' && sede.trim() !== '') {
             params.push(sede.trim());
@@ -136,7 +162,7 @@ app.get('/api/reportes/excel', async (req, res) => {
             sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length})`;
         }
 
-        sql += ` ORDER BY CAST(p.orden AS INTEGER) ASC`;
+        sql += ` ORDER BY p.id ASC`;
 
         const result = await pool.query(sql, params);
         let filas = result.rows;
@@ -175,7 +201,7 @@ app.get('/api/reportes/excel', async (req, res) => {
     }
 });
 
-// 5. Registrar y actualizar Incidencias
+// 5. Registrar Incidencias
 app.post('/api/incidencias', async (req, res) => {
     try {
         const { dni, col_turno, tipo, estado = 'Pendiente', observaciones } = req.body;
