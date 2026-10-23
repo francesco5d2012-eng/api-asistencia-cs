@@ -1,169 +1,198 @@
-require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
+const { Pool } = require('pg');
+const ExcelJS = require('exceljs');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
 app.use(cors());
 app.use(express.json());
 
-// Conexión a PostgreSQL en Neon Cloud
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
-// Función auxiliar para contar padrón total, presentes y faltantes por turno
-async function obtenerMetricas(colTurno) {
-  const totalRes = await pool.query('SELECT COUNT(*) FROM participantes');
-  const presRes = await pool.query('SELECT COUNT(*) FROM asistencias WHERE col_turno = $1', [colTurno]);
-  const total = parseInt(totalRes.rows[0].count, 10) || 0;
-  const presentes = parseInt(presRes.rows[0].count, 10) || 0;
-  return { total, presentes, faltantes: Math.max(0, total - presentes) };
-}
-
-// Ruta de verificación
-app.get('/', (req, res) => {
-  res.send('API Control de Asistencia CS - Operativa');
+// 1. Obtener lista única de Sedes Jurisdiccionales para el filtro
+app.get('/api/sedes', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT DISTINCT sede_jurisdiccional FROM participantes WHERE sede_jurisdiccional IS NOT NULL ORDER BY sede_jurisdiccional ASC`
+        );
+        res.json(result.rows.map(r => r.sede_jurisdiccional));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-// 1. ENDPOINT GET: Resumen por turno (/api/asistencia?col=10)
-app.get('/api/asistencia', async (req, res) => {
-  try {
-    const col = parseInt(req.query.col, 10) || 10;
-    const metricas = await obtenerMetricas(col);
-    res.json({ estado: "RESUMEN", ...metricas });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 2. ENDPOINT GET: Reporte detallado con filtros para la Web (/api/reporte?col=10&buscar=&estado=TODOS)
+// 2. Obtener reporte principal (con filtros de turno, sede, búsqueda y estado)
 app.get('/api/reporte', async (req, res) => {
-  try {
-    const col = parseInt(req.query.col, 10) || 10;
-    const busqueda = req.query.buscar || "";
-    const filtroEstado = req.query.estado || "TODOS"; // TODOS, PRESENTE, FALTANTE
+    try {
+        const { col = 10, buscar = '', estado = 'TODOS', sede = 'TODAS' } = req.query;
 
-    let query = `
-      SELECT 
-        p.orden,
-        p.sede_regional,
-        p.sede_jurisdiccional,
-        p.apellido_paterno,
-        p.apellido_materno,
-        p.nombres,
-        p.dni,
-        p.telefono,
-        CASE WHEN a.id IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
-        TO_CHAR(a.fecha_hora, 'DD/MM/YYYY HH24:MI:SS') AS fecha_hora
-      FROM participantes p
-      LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
-      WHERE (p.dni ILIKE $2 OR p.nombres ILIKE $2 OR p.apellido_paterno ILIKE $2 OR p.apellido_materno ILIKE $2)
-    `;
+        let sql = `
+            SELECT p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
+                   p.sede_regional, p.sede_jurisdiccional,
+                   CASE WHEN a.dni IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
+                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora,
+                   (SELECT tipo || ' (' || estado || ')' FROM incidencias i WHERE i.dni = p.dni AND i.col_turno = $1 ORDER BY id DESC LIMIT 1) AS incidencia
+            FROM participantes p
+            LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
+            WHERE 1=1
+        `;
+        let params = [col];
 
-    const params = [col, `%${busqueda}%`];
+        if (sede !== 'TODAS' && sede.trim() !== '') {
+            params.push(sede.trim());
+            sql += ` AND p.sede_jurisdiccional = $${params.length}`;
+        }
 
-    if (filtroEstado !== "TODOS") {
-      if (filtroEstado === "PRESENTE") {
-        query += ` AND a.id IS NOT NULL`;
-      } else {
-        query += ` AND a.id IS NULL`;
-      }
+        if (buscar.trim() !== '') {
+            params.push(`%${buscar.trim()}%`);
+            sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length} OR p.apellido_materno ILIKE $${params.length})`;
+        }
+
+        sql += ` ORDER BY CAST(p.orden AS INTEGER) ASC`;
+
+        const result = await pool.query(sql, params);
+        let asistentes = result.rows;
+
+        const total = asistentes.length;
+        const presentes = asistentes.filter(i => i.estado === 'PRESENTE').length;
+        const faltantes = total - presentes;
+
+        if (estado === 'PRESENTE') {
+            asistentes = asistentes.filter(i => i.estado === 'PRESENTE');
+        } else if (estado === 'FALTANTE') {
+            asistentes = asistentes.filter(i => i.estado === 'FALTANTE');
+        }
+
+        res.json({ total, presentes, faltantes, asistentes });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
-
-    query += ` ORDER BY p.orden::int ASC;`;
-
-    const resultado = await pool.query(query, params);
-    const metricas = await obtenerMetricas(col);
-
-    res.json({
-      ...metricas,
-      asistentes: resultado.rows
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
-// 3. ENDPOINT POST: Registrar asistencia por DNI o QR (/api/asistencia)
+// 3. Registrar asistencia (Desde App Móvil Kotlin) y emitir por WebSocket
 app.post('/api/asistencia', async (req, res) => {
-  try {
-    let { dni, col, turno } = req.body;
-    dni = String(dni || "").trim().padStart(8, '0');
-    const colTurno = parseInt(col, 10) || 10;
+    try {
+        const { dni, col_turno, etiqueta_turno } = req.body;
 
-    // 1. Buscar participante en el padrón
-    const partRes = await pool.query('SELECT * FROM participantes WHERE dni = $1', [dni]);
+        const partCheck = await pool.query(`SELECT * FROM participantes WHERE dni = $1`, [dni]);
+        if (partCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'DNI no encontrado en el padrón' });
+        }
 
-    if (partRes.rows.length === 0) {
-      const metricas = await obtenerMetricas(colTurno);
-      return res.json({
-        estado: "NO_REGISTRADO",
-        titulo: "DNI NO SE ENCUENTRA EN EL PADRÓN",
-        dni,
-        turno,
-        ...metricas
-      });
+        const insertQuery = `
+            INSERT INTO asistencias (dni, col_turno, etiqueta_turno)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (dni, col_turno) 
+            DO UPDATE SET fecha_hora = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Lima')
+            RETURNING *;
+        `;
+        const result = await pool.query(insertQuery, [dni, col_turno, etiqueta_turno || `Turno ${col_turno}`]);
+
+        // Notificar a todos los paneles web abiertos en tiempo real
+        io.emit('actualizacion_asistencia', {
+            dni,
+            col_turno,
+            participante: partCheck.rows[0]
+        });
+
+        res.json({ ok: true, registro: result.rows[0], participante: partCheck.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
+});
 
-    const p = partRes.rows[0];
-    const nombreCompleto = `${p.apellido_paterno} ${p.apellido_materno}, ${p.nombres}`.trim();
+// 4. Descargar Reporte Consolidado en Excel (.xlsx)
+app.get('/api/reportes/excel', async (req, res) => {
+    try {
+        const { col = 10, sede = 'TODAS', estado = 'TODOS', buscar = '' } = req.query;
 
-    // 2. Verificar si ya se registró en este turno
-    const asisExistente = await pool.query(
-      "SELECT TO_CHAR(fecha_hora, 'DD/MM/YYYY HH24:MI:SS') as fh FROM asistencias WHERE dni = $1 AND col_turno = $2",
-      [dni, colTurno]
-    );
+        let sql = `
+            SELECT p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
+                   p.sede_regional, p.sede_jurisdiccional,
+                   CASE WHEN a.dni IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
+                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora,
+                   (SELECT tipo || ' - ' || estado || ': ' || COALESCE(observaciones,'') FROM incidencias i WHERE i.dni = p.dni AND i.col_turno = $1 ORDER BY id DESC LIMIT 1) AS incidencia
+            FROM participantes p
+            LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
+            WHERE 1=1
+        `;
+        let params = [col];
 
-    if (asisExistente.rows.length > 0) {
-      const metricas = await obtenerMetricas(colTurno);
-      return res.json({
-        estado: "DUPLICADO",
-        titulo: "DNI YA REGISTRADO EN ESTE TURNO",
-        dni: p.dni,
-        orden: p.orden || "",
-        nombre: nombreCompleto,
-        sedeRegional: p.sede_regional || "",
-        sedeJurisdiccional: p.sede_jurisdiccional || "",
-        seguro: p.seguro || "",
-        telefono: p.telefono || "",
-        turno,
-        fechaHora: asisExistente.rows[0].fh,
-        ...metricas
-      });
+        if (sede !== 'TODAS' && sede.trim() !== '') {
+            params.push(sede.trim());
+            sql += ` AND p.sede_jurisdiccional = $${params.length}`;
+        }
+
+        if (buscar.trim() !== '') {
+            params.push(`%${buscar.trim()}%`);
+            sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length})`;
+        }
+
+        sql += ` ORDER BY CAST(p.orden AS INTEGER) ASC`;
+
+        const result = await pool.query(sql, params);
+        let filas = result.rows;
+
+        if (estado !== 'TODOS') {
+            filas = filas.filter(r => r.estado === estado);
+        }
+
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet('Asistencia CS 2026');
+
+        sheet.columns = [
+            { header: 'Nº', key: 'orden', width: 6 },
+            { header: 'DNI', key: 'dni', width: 12 },
+            { header: 'Apellido Paterno', key: 'apellido_paterno', width: 18 },
+            { header: 'Apellido Materno', key: 'apellido_materno', width: 18 },
+            { header: 'Nombres', key: 'nombres', width: 25 },
+            { header: 'Sede Regional', key: 'sede_regional', width: 20 },
+            { header: 'Sede Jurisdiccional', key: 'sede_jurisdiccional', width: 24 },
+            { header: 'Estado', key: 'estado', width: 14 },
+            { header: 'Hora Registro', key: 'fecha_hora', width: 20 },
+            { header: 'Incidencia / Justificación', key: 'incidencia', width: 35 }
+        ];
+
+        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D47A1' } };
+
+        sheet.addRows(filas);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=Reporte_Asistencia_Turno_${col}.xlsx`);
+        await workbook.xlsx.write(res);
+        res.end();
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
+});
 
-    // 3. Insertar nueva asistencia
-    const insertRes = await pool.query(
-      `INSERT INTO asistencias (dni, col_turno, etiqueta_turno) 
-       VALUES ($1, $2, $3) 
-       RETURNING TO_CHAR(fecha_hora, 'DD/MM/YYYY HH24:MI:SS') as fh`,
-      [dni, colTurno, turno]
-    );
+// 5. Registrar y actualizar Incidencias
+app.post('/api/incidencias', async (req, res) => {
+    try {
+        const { dni, col_turno, tipo, estado = 'Pendiente', observaciones } = req.body;
+        const result = await pool.query(
+            `INSERT INTO incidencias (dni, col_turno, tipo, estado, observaciones) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [dni, col_turno, tipo, estado, observaciones]
+        );
+        io.emit('actualizacion_asistencia', { dni, col_turno });
+        res.json({ ok: true, incidencia: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
-    const metricas = await obtenerMetricas(colTurno);
-    return res.json({
-      estado: "REGISTRADO",
-      titulo: "ASISTENCIA REGISTRADA CORRECTAMENTE",
-      dni: p.dni,
-      orden: p.orden || "",
-      nombre: nombreCompleto,
-      sedeRegional: p.sede_regional || "",
-      sedeJurisdiccional: p.sede_jurisdiccional || "",
-      seguro: p.seguro || "",
-      telefono: p.telefono || "",
-      turno,
-      fechaHora: insertRes.rows[0].fh,
-      ...metricas
-    });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+io.on('connection', (socket) => {
+    console.log('Panel Web conectado en tiempo real:', socket.id);
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
-});
+server.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
