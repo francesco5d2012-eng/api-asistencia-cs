@@ -17,13 +17,13 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Crear automáticamente la tabla de incidencias al iniciar para evitar errores
+// Crear tabla de incidencias sin llaves foráneas estrictas que puedan chocar
 async function inicializarBD() {
     try {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS incidencias (
                 id SERIAL PRIMARY KEY,
-                dni VARCHAR(8) NOT NULL REFERENCES participantes(dni) ON DELETE CASCADE,
+                dni VARCHAR(20) NOT NULL,
                 col_turno INT NOT NULL,
                 tipo VARCHAR(50) NOT NULL,
                 estado VARCHAR(20) DEFAULT 'Pendiente',
@@ -31,9 +31,8 @@ async function inicializarBD() {
                 fecha_registro TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Lima')
             );
         `);
-        console.log("Tabla incidencias verificada correctamente.");
     } catch (err) {
-        console.error("Error al verificar tabla incidencias:", err.message);
+        console.error("Aviso tabla incidencias:", err.message);
     }
 }
 inicializarBD();
@@ -50,22 +49,22 @@ app.get('/api/sedes', async (req, res) => {
     }
 });
 
-// 2. Obtener reporte principal
+// 2. Obtener reporte principal (Blindado para mostrar siempre los 165 participantes)
 app.get('/api/reporte', async (req, res) => {
     try {
         const { col = 10, buscar = '', estado = 'TODOS', sede = 'TODAS' } = req.query;
+        const turno = parseInt(col, 10) || 10;
 
         let sql = `
-            SELECT p.id, p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
+            SELECT p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
                    p.sede_regional, p.sede_jurisdiccional,
                    CASE WHEN a.dni IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
-                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora,
-                   (SELECT tipo || ' (' || estado || ')' FROM incidencias i WHERE i.dni = p.dni AND i.col_turno = $1 ORDER BY id DESC LIMIT 1) AS incidencia
+                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora
             FROM participantes p
             LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
             WHERE 1=1
         `;
-        let params = [parseInt(col, 10) || 10];
+        let params = [turno];
 
         if (sede !== 'TODAS' && sede.trim() !== '') {
             params.push(sede.trim());
@@ -77,10 +76,20 @@ app.get('/api/reporte', async (req, res) => {
             sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length} OR p.apellido_materno ILIKE $${params.length})`;
         }
 
-        sql += ` ORDER BY p.id ASC`;
+        sql += ` ORDER BY CAST(NULLIF(regexp_replace(p.orden, '\\D', '', 'g'), '') AS INTEGER) ASC NULLS LAST`;
 
         const result = await pool.query(sql, params);
         let asistentes = result.rows;
+
+        // Intentar cruzar incidencias de forma independiente (si falla, no rompe la lista)
+        try {
+            const incResult = await pool.query(`SELECT dni, tipo, estado FROM incidencias WHERE col_turno = $1 ORDER BY id ASC`, [turno]);
+            const mapaInc = {};
+            incResult.rows.forEach(r => { mapaInc[r.dni] = `${r.tipo} (${r.estado})`; });
+            asistentes = asistentes.map(a => ({ ...a, incidencia: mapaInc[a.dni] || null }));
+        } catch (e) {
+            asistentes = asistentes.map(a => ({ ...a, incidencia: null }));
+        }
 
         const total = asistentes.length;
         const presentes = asistentes.filter(i => i.estado === 'PRESENTE').length;
@@ -99,11 +108,11 @@ app.get('/api/reporte', async (req, res) => {
     }
 });
 
-// 3. Registrar asistencia (soporta tanto /api/asistencia como /api/registrar)
+// 3. Registrar asistencia (soporta todas las rutas de la App Móvil)
 async function registrarAsistenciaHandler(req, res) {
     try {
         const { dni, col_turno, col, etiqueta_turno } = req.body;
-        const turnoFinal = col_turno || col || 10;
+        const turnoFinal = parseInt(col_turno || col || 10, 10);
 
         const partCheck = await pool.query(`SELECT * FROM participantes WHERE dni = $1`, [dni]);
         if (partCheck.rows.length === 0) {
@@ -139,18 +148,18 @@ app.post('/api/asistencia/registrar', registrarAsistenciaHandler);
 app.get('/api/reportes/excel', async (req, res) => {
     try {
         const { col = 10, sede = 'TODAS', estado = 'TODOS', buscar = '' } = req.query;
+        const turno = parseInt(col, 10) || 10;
 
         let sql = `
             SELECT p.orden, p.dni, p.apellido_paterno, p.apellido_materno, p.nombres, 
                    p.sede_regional, p.sede_jurisdiccional,
                    CASE WHEN a.dni IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
-                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora,
-                   (SELECT tipo || ' - ' || estado || ': ' || COALESCE(observaciones,'') FROM incidencias i WHERE i.dni = p.dni AND i.col_turno = $1 ORDER BY id DESC LIMIT 1) AS incidencia
+                   to_char(a.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS fecha_hora
             FROM participantes p
             LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
             WHERE 1=1
         `;
-        let params = [parseInt(col, 10) || 10];
+        let params = [turno];
 
         if (sede !== 'TODAS' && sede.trim() !== '') {
             params.push(sede.trim());
@@ -162,10 +171,19 @@ app.get('/api/reportes/excel', async (req, res) => {
             sql += ` AND (p.dni ILIKE $${params.length} OR p.nombres ILIKE $${params.length} OR p.apellido_paterno ILIKE $${params.length})`;
         }
 
-        sql += ` ORDER BY p.id ASC`;
+        sql += ` ORDER BY CAST(NULLIF(regexp_replace(p.orden, '\\D', '', 'g'), '') AS INTEGER) ASC NULLS LAST`;
 
         const result = await pool.query(sql, params);
         let filas = result.rows;
+
+        try {
+            const incResult = await pool.query(`SELECT dni, tipo, estado, observaciones FROM incidencias WHERE col_turno = $1 ORDER BY id ASC`, [turno]);
+            const mapaInc = {};
+            incResult.rows.forEach(r => { mapaInc[r.dni] = `${r.tipo} (${r.estado}): ${r.observaciones || ''}`; });
+            filas = filas.map(a => ({ ...a, incidencia: mapaInc[a.dni] || '' }));
+        } catch (e) {
+            filas = filas.map(a => ({ ...a, incidencia: '' }));
+        }
 
         if (estado !== 'TODOS') {
             filas = filas.filter(r => r.estado === estado);
@@ -193,7 +211,7 @@ app.get('/api/reportes/excel', async (req, res) => {
         sheet.addRows(filas);
 
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename=Reporte_Asistencia_Turno_${col}.xlsx`);
+        res.setHeader('Content-Disposition', `attachment; filename=Reporte_Asistencia_Turno_${turno}.xlsx`);
         await workbook.xlsx.write(res);
         res.end();
     } catch (error) {
@@ -207,7 +225,7 @@ app.post('/api/incidencias', async (req, res) => {
         const { dni, col_turno, tipo, estado = 'Pendiente', observaciones } = req.body;
         const result = await pool.query(
             `INSERT INTO incidencias (dni, col_turno, tipo, estado, observaciones) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [dni, col_turno, tipo, estado, observaciones]
+            [dni, parseInt(col_turno, 10) || 10, tipo, estado, observaciones]
         );
         io.emit('actualizacion_asistencia', { dni, col_turno });
         res.json({ ok: true, incidencia: result.rows[0] });
@@ -217,7 +235,7 @@ app.post('/api/incidencias', async (req, res) => {
 });
 
 io.on('connection', (socket) => {
-    console.log('Panel Web conectado en tiempo real:', socket.id);
+    console.log('Panel Web conectado:', socket.id);
 });
 
 const PORT = process.env.PORT || 3000;
