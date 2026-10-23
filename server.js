@@ -38,7 +38,55 @@ app.get('/api/asistencia', async (req, res) => {
   }
 });
 
-// 2. ENDPOINT POST: Registrar asistencia por DNI o QR (/api/asistencia)
+// 2. ENDPOINT GET: Reporte detallado con filtros para la Web (/api/reporte?col=10&buscar=&estado=TODOS)
+app.get('/api/reporte', async (req, res) => {
+  try {
+    const col = parseInt(req.query.col, 10) || 10;
+    const busqueda = req.query.buscar || "";
+    const filtroEstado = req.query.estado || "TODOS"; // TODOS, PRESENTE, FALTANTE
+
+    let query = `
+      SELECT 
+        p.orden,
+        p.sede_regional,
+        p.sede_jurisdiccional,
+        p.apellido_paterno,
+        p.apellido_materno,
+        p.nombres,
+        p.dni,
+        p.telefono,
+        CASE WHEN a.id IS NOT NULL THEN 'PRESENTE' ELSE 'FALTANTE' END AS estado,
+        TO_CHAR(a.fecha_hora, 'DD/MM/YYYY HH24:MI:SS') AS fecha_hora
+      FROM participantes p
+      LEFT JOIN asistencias a ON p.dni = a.dni AND a.col_turno = $1
+      WHERE (p.dni ILIKE $2 OR p.nombres ILIKE $2 OR p.apellido_paterno ILIKE $2 OR p.apellido_materno ILIKE $2)
+    `;
+
+    const params = [col, `%${busqueda}%`];
+
+    if (filtroEstado !== "TODOS") {
+      if (filtroEstado === "PRESENTE") {
+        query += ` AND a.id IS NOT NULL`;
+      } else {
+        query += ` AND a.id IS NULL`;
+      }
+    }
+
+    query += ` ORDER BY p.orden::int ASC;`;
+
+    const resultado = await pool.query(query, params);
+    const metricas = await obtenerMetricas(col);
+
+    res.json({
+      ...metricas,
+      asistentes: resultado.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. ENDPOINT POST: Registrar asistencia por DNI o QR (/api/asistencia)
 app.post('/api/asistencia', async (req, res) => {
   try {
     let { dni, col, turno } = req.body;
